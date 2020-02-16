@@ -13,17 +13,44 @@ The Simple Service Discovery Protocol (SSDP) is a network protocol based on the 
 * MAC OSX
 * Android
 * iOS
+* Windows 10 x64 with VC++ 2017
 
 ====
 
 ### How To Build and Test
+
+#### Using Makefile 
 
 ```
 make clean
 make
 
 cd test
-./daemon.exe
+./daemon
+```
+
+#### Using CMake for Linux
+
+```
+mkdir build 
+cd build
+cmake -DCMAKE_BUILD_TYPE=Debug -DINSTALL_PREFIX=./../package --G "Unix Makefile" ./.. 
+
+make install
+
+cd test
+./daemon
+```
+
+#### Using CMake for Windows
+
+```
+mkdir build 
+cd build
+cmake -DCMAKE_INSTALL_PREFIX=./../package/ -G "Visual Studio 15 2017 Win64" ./source
+
+devenv ./lssdp.sln
+
 ```
 
 ====
@@ -41,6 +68,10 @@ lssdp context
 **neighbor_timeout** - this value will be used by `lssdp_neighbor_check_timeout`. If neighbor is timeout, then remove from neighbor list.
 
 **debug** - SSDP debug mode, show debug message.
+
+**rcv_packets_from_myself** - adjust wether receive packets from the same host or not 
+
+**send_to_localhost** - adjustment of sending to localhost (127.0.0.1) as well
 
 **interface** - Network Interface list. Call `lssdp_network_interface_update` to update the list.
 
@@ -65,6 +96,22 @@ lssdp context
 ====
 
 #### Function API (8)
+
+##### 00. lssdp_init
+
+init the library
+
+```
+- usually only necessary for windoows api. this will call WSAInit
+```
+
+##### 00. lssdp_deinit
+
+deinit the library
+
+```
+- usually only necessary for windoows api. this will call WSACleanUp
+```
 
 ##### 01. lssdp_network_interface_update
 
@@ -142,3 +189,7 @@ the timeout neighbor will be remove from the list.
 ##### 08. lssdp_set_log_callback
 
 setup SSDP log callback. All SSDP library log will be forward to here.
+
+##### 09. lssdp_get_current_time
+
+helper function to get a platform indepentend timstamp .

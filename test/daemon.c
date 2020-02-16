@@ -2,9 +2,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#ifdef WIN32
+#else
 #include <unistd.h>     // select
-#include <sys/time.h>   // gettimeofday
-#include "lssdp.h"
+#include <arpa/inet.h> 
+#endif
+//include lssdp library
+#include <lssdp.h>
 
 /* daemon.c
  *
@@ -31,15 +35,6 @@ void log_callback(const char * file, const char * tag, int level, int line, cons
     printf("[%-5s][%s] %s", level_name, tag, message);
 }
 
-long long get_current_time() {
-    struct timeval time = {};
-    if (gettimeofday(&time, NULL) == -1) {
-        printf("gettimeofday failed, errno = %s (%d)\n", strerror(errno), errno);
-        return -1;
-    }
-    return (long long) time.tv_sec * 1000 + (long long) time.tv_usec / 1000;
-}
-
 int show_neighbor_list(lssdp_ctx * lssdp) {
     int i = 0;
     lssdp_nbr * nbr;
@@ -62,11 +57,13 @@ int show_interface_list_and_rebind_socket(lssdp_ctx * lssdp) {
     // 1. show interface list
     printf("\nNetwork Interface List (%zu):\n", lssdp->interface_num);
     size_t i;
+    
     for (i = 0; i < lssdp->interface_num; i++) {
-        printf("%zu. %-6s: %s\n",
+        printf("%zu. %-6s: %s mask: %s\n",
             i + 1,
-            lssdp->interface[i].name,
-            lssdp->interface[i].ip
+            lssdp->intf[i].name,
+            lssdp->intf[i].ip,
+            inet_ntoa(*(struct in_addr*)&lssdp->intf[i].netmask)
         );
     }
     printf("%s\n", i == 0 ? "Empty" : "");
@@ -82,10 +79,14 @@ int show_interface_list_and_rebind_socket(lssdp_ctx * lssdp) {
 
 
 int main() {
+
+    lssdp_init();
     lssdp_set_log_callback(log_callback);
 
     lssdp_ctx lssdp = {
-        // .debug = true,           // debug
+        .debug = false,                      // debug
+        .rcv_packets_from_myself = true,     // receive packets from this machine
+        .send_to_localhost = true,           // sending to localhost as well
         .port = 1900,
         .neighbor_timeout = 15000,  // 15 seconds
         .header = {
@@ -106,9 +107,10 @@ int main() {
      */
     lssdp_network_interface_update(&lssdp);
 
-    long long last_time = get_current_time();
+    long long last_time = lssdp_get_current_time();
     if (last_time < 0) {
         printf("got invalid timestamp %lld\n", last_time);
+        lssdp_deinit();
         return EXIT_SUCCESS;
     }
 
@@ -132,7 +134,7 @@ int main() {
         }
 
         // get current time
-        long long current_time = get_current_time();
+        long long current_time = lssdp_get_current_time();
         if (current_time < 0) {
             printf("got invalid timestamp %lld\n", current_time);
             break;
@@ -149,5 +151,6 @@ int main() {
         }
     }
 
+    lssdp_deinit();
     return EXIT_SUCCESS;
 }

@@ -1,8 +1,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+//include lssdp library
+#include <lssdp.h>
+#ifdef WIN32
+#include <Windows.h>
+void sleep(int ms)
+{
+    Sleep(ms);
+}
+#else 
 #include <unistd.h>     // sleep
-#include "lssdp.h"
+#endif
+
 
 /* network_interface.c
  *
@@ -25,12 +36,12 @@ int show_interface_list(lssdp_ctx * lssdp) {
     for (i = 0; i < lssdp->interface_num; i++) {
         printf("%zu. %-6s: %-15s (%d.%d.%d.%d)\n",
             i + 1,
-            lssdp->interface[i].name,
-            lssdp->interface[i].ip,
-            (lssdp->interface[i].netmask >> 0)  & 0xff,
-            (lssdp->interface[i].netmask >> 8)  & 0xff,
-            (lssdp->interface[i].netmask >> 16) & 0xff,
-            (lssdp->interface[i].netmask >> 24) & 0xff
+            lssdp->intf[i].name,
+            lssdp->intf[i].ip,
+            (lssdp->intf[i].netmask >> 0)  & 0xff,
+            (lssdp->intf[i].netmask >> 8)  & 0xff,
+            (lssdp->intf[i].netmask >> 16) & 0xff,
+            (lssdp->intf[i].netmask >> 24) & 0xff
         );
     }
     printf("%s\n", i == 0 ? "Empty" : "");
@@ -38,6 +49,8 @@ int show_interface_list(lssdp_ctx * lssdp) {
 }
 
 int main() {
+
+    lssdp_init();
     lssdp_set_log_callback(log_callback);
 
     lssdp_ctx lssdp = {
@@ -49,6 +62,7 @@ int main() {
         puts(".");
         lssdp_network_interface_update(&lssdp);
     }
+    lssdp_deinit();
 
     return EXIT_SUCCESS;
 }
