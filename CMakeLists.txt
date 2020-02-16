@@ -36,7 +36,7 @@ target_include_directories(lssdp PUBLIC
 if(MSVC)
     target_link_libraries(lssdp PUBLIC Ws2_32.lib Iphlpapi.lib)
 endif()
-if (lssdp_enable_tests)
+if (${lssdp_enable_tests})
    add_subdirectory(test)
 endif()
 
