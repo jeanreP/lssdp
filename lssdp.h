@@ -4,6 +4,13 @@
 #include <stdbool.h>  // bool, true, false
 #include <stdint.h>   // uint32_t
 
+#ifdef WIN32
+#include <WinSock2.h>
+#define SOCKET_TYPE SOCKET
+#else //WIN32
+#define SOCKET_TYPE int
+#endif //WIN32
+
 // LSSDP Log Level
 enum LSSDP_LOG {
     LSSDP_LOG_DEBUG = 1 << 0,
@@ -32,11 +39,13 @@ typedef struct lssdp_nbr {
 #define LSSDP_INTERFACE_LIST_SIZE   16
 #define LSSDP_IP_LEN                16
 typedef struct lssdp_ctx {
-    int             sock;                                   // SSDP socket
+    SOCKET_TYPE     sock;                                   // SSDP socket
     unsigned short  port;                                   // SSDP port (0x0000 ~ 0xFFFF)
     lssdp_nbr *     neighbor_list;                          // SSDP neighbor list
     long            neighbor_timeout;                       // milliseconds
     bool            debug;                                  // show debug log
+    bool            rcv_packets_from_myself;                // receive packets from this machine
+    bool            send_to_localhost;                      // sending to localhost as well
 
     /* Network Interface */
     size_t          interface_num;                          // interface number
@@ -45,7 +54,7 @@ typedef struct lssdp_ctx {
         char        ip          [LSSDP_IP_LEN];             // ip[16] = "xxx.xxx.xxx.xxx"
         uint32_t    addr;                                   // address in network byte order
         uint32_t    netmask;                                // mask in network byte order
-    } interface[LSSDP_INTERFACE_LIST_SIZE];                 // interface[16]
+    } intf[LSSDP_INTERFACE_LIST_SIZE];                      // interface[16]
 
     /* SSDP Header Fields */
     struct {
@@ -70,6 +79,31 @@ typedef struct lssdp_ctx {
 
 } lssdp_ctx;
 
+/*
+ * 00. lssdp_init
+ *
+ * initialized the socket api within lssdp 
+ *
+ * Note:
+ *  - this is usually only necessary for window
+ *  - do not forget to call lssdp_deinit
+ *
+ * @return = 0      success
+ *         < 0      failed
+ */
+int lssdp_init();
+
+/*
+ * 00. lssdp_deinit
+ *
+ * deintializes the socket api within lssdp
+ *
+ * Note:
+ *  - this is usually only necessary for window
+ *  - only call it after lssdp_init
+ *
+ */
+void lssdp_deinit();
 
 /*
  * 01. lssdp_network_interface_update
@@ -188,5 +222,14 @@ int lssdp_neighbor_check_timeout(lssdp_ctx * lssdp);
  * @param callback
  */
 void lssdp_set_log_callback(void (* callback)(const char * file, const char * tag, int level, int line, const char * func, const char * message));
+
+/*
+ * 09. lssdp_get_current_time
+ *
+ * helper function to get a platform indepentend timstamp of current time
+ *
+ * @return continous time value.
+ */
+long long lssdp_get_current_time();
 
 #endif

@@ -4,14 +4,26 @@
 #include <string.h>     // memset, memcpy, strlen, strcpy, strcmp, strncasecmp, strerror
 #include <ctype.h>      // isprint, isspace
 #include <errno.h>      // errno
+
+#ifdef WIN32
+#include <WinSock2.h>
+#include <Ws2def.h>
+#include <iphlpapi.h>
+#include <heapapi.h>
+#include <ws2tcpip.h>
+
+#pragma warning( disable : 4996 )
+
+#else //WIN32
 #include <unistd.h>     // close
 #include <sys/time.h>   // gettimeofday
 #include <sys/ioctl.h>  // ioctl, FIONBIO
 #include <net/if.h>     // struct ifconf, struct ifreq
-#include <fcntl.h>      // fcntl, F_GETFD, F_SETFD, FD_CLOEXEC
 #include <sys/socket.h> // struct sockaddr, AF_INET, SOL_SOCKET, socklen_t, setsockopt, socket, bind, sendto, recvfrom
 #include <netinet/in.h> // struct sockaddr_in, struct ip_mreq, INADDR_ANY, IPPROTO_IP, also include <sys/socket.h>
 #include <arpa/inet.h>  // inet_aton, inet_ntop, inet_addr, also include <netinet/in.h>
+#endif //WIN32
+#include <fcntl.h>      // fcntl, F_GETFD, F_SETFD, FD_CLOEXEC
 #include "lssdp.h"
 
 #ifndef _SIZEOF_ADDR_IFREQ
@@ -20,10 +32,17 @@
 
 /** Definition **/
 #define LSSDP_BUFFER_LEN    2048
-#define lssdp_debug(fmt, agrs...) lssdp_log(LSSDP_LOG_DEBUG, __LINE__, __func__, fmt, ##agrs)
-#define lssdp_info(fmt, agrs...)  lssdp_log(LSSDP_LOG_INFO,  __LINE__, __func__, fmt, ##agrs)
-#define lssdp_warn(fmt, agrs...)  lssdp_log(LSSDP_LOG_WARN,  __LINE__, __func__, fmt, ##agrs)
-#define lssdp_error(fmt, agrs...) lssdp_log(LSSDP_LOG_ERROR, __LINE__, __func__, fmt, ##agrs)
+#ifdef WIN32
+#define lssdp_debug(fmt, ...) lssdp_log(LSSDP_LOG_DEBUG, __LINE__, __func__, fmt, __VA_ARGS__)
+#define lssdp_info(fmt, ...)  lssdp_log(LSSDP_LOG_INFO,  __LINE__, __func__, fmt, __VA_ARGS__)
+#define lssdp_warn(fmt, ...)  lssdp_log(LSSDP_LOG_WARN,  __LINE__, __func__, fmt, __VA_ARGS__)
+#define lssdp_error(fmt, ...) lssdp_log(LSSDP_LOG_ERROR, __LINE__, __func__, fmt, __VA_ARGS__)
+#else //WIN32
+#define lssdp_debug(fmt, args...) lssdp_log(LSSDP_LOG_DEBUG, __LINE__, __func__, fmt, ##args)
+#define lssdp_info(fmt, args...)  lssdp_log(LSSDP_LOG_INFO,  __LINE__, __func__, fmt, ##args)
+#define lssdp_warn(fmt, args...)  lssdp_log(LSSDP_LOG_WARN,  __LINE__, __func__, fmt, ##args)
+#define lssdp_error(fmt, args...) lssdp_log(LSSDP_LOG_ERROR, __LINE__, __func__, fmt, ##args)
+#endif
 
 
 /** Struct: lssdp_packet **/
@@ -41,13 +60,12 @@ typedef struct lssdp_packet {
 
 
 /** Internal Function **/
-static int send_multicast_data(const char * data, const struct lssdp_interface interface, unsigned short ssdp_port);
+static int send_multicast_data(const char * data, const struct lssdp_interface intf, unsigned short ssdp_port);
 static int lssdp_send_response(lssdp_ctx * lssdp, struct sockaddr_in address);
 static int lssdp_packet_parser(const char * data, size_t data_len, lssdp_packet * packet);
 static int parse_field_line(const char * data, size_t start, size_t end, lssdp_packet * packet);
 static int get_colon_index(const char * string, size_t start, size_t end);
 static int trim_spaces(const char * string, size_t * start, size_t * end);
-static long long get_current_time();
 static int lssdp_log(int level, int line, const char * func, const char * format, ...);
 static int neighbor_list_add(lssdp_ctx * lssdp, const lssdp_packet packet);
 static int lssdp_neighbor_remove_all(lssdp_ctx * lssdp);
@@ -90,6 +108,25 @@ static struct {
 };
 
 
+// 00. lssdp_init
+int lssdp_init()
+{
+#ifdef WIN32
+    WSADATA wsaData;
+    return WSAStartup(MAKEWORD(2, 2), &wsaData);
+#endif 
+    return 0;
+}
+
+
+// 00. lssdp_deinit
+void lssdp_deinit()
+{
+#ifdef WIN32
+    WSACleanup();
+#endif 
+}
+
 // 01. lssdp_network_interface_update
 int lssdp_network_interface_update(lssdp_ctx * lssdp) {
     if (lssdp == NULL) {
@@ -100,28 +137,126 @@ int lssdp_network_interface_update(lssdp_ctx * lssdp) {
     const size_t SIZE_OF_INTERFACE_LIST = sizeof(struct lssdp_interface) * LSSDP_INTERFACE_LIST_SIZE;
 
     // 1. copy orginal interface
-    struct lssdp_interface original_interface[LSSDP_INTERFACE_LIST_SIZE] = {};
-    memcpy(original_interface, lssdp->interface, SIZE_OF_INTERFACE_LIST);
+    struct lssdp_interface original_interface[LSSDP_INTERFACE_LIST_SIZE];
+    memset(original_interface, 0, sizeof(original_interface));
+    memcpy(original_interface, lssdp->intf, SIZE_OF_INTERFACE_LIST);
 
     // 2. reset lssdp->interface
     lssdp->interface_num = 0;
-    memset(lssdp->interface, 0, SIZE_OF_INTERFACE_LIST);
+    memset(lssdp->intf, 0, SIZE_OF_INTERFACE_LIST);
 
     int result = -1;
 
+#ifdef WIN32
+    #define WORKING_BUFFER_SIZE 15000
+    #define MAX_TRIES 3
+
+    #define MALLOC(x) HeapAlloc(GetProcessHeap(), 0, (x))
+    #define FREE(x) HeapFree(GetProcessHeap(), 0, (x))
+    DWORD dwSize = 0;
+    DWORD dwRetVal = 0;
+
+    ULONG byte_size_of_adapters_info = 1 * sizeof(IP_ADAPTER_INFO);
+    PIP_ADAPTER_INFO p_adaptersinfo = MALLOC(byte_size_of_adapters_info);
+    dwRetVal = GetAdaptersInfo(p_adaptersinfo, &byte_size_of_adapters_info);
+    if (dwRetVal == ERROR_BUFFER_OVERFLOW)
+    {
+        FREE(p_adaptersinfo);
+        if (byte_size_of_adapters_info > 0)
+        {
+            p_adaptersinfo = MALLOC(byte_size_of_adapters_info);
+        }
+        else
+        {
+            lssdp_error("Call to GetAdaptersAddresses failed with error: %d\n",
+                dwRetVal);
+            return -1;
+        }
+    }
+    else if (dwRetVal != NO_ERROR)
+    {
+        FREE(p_adaptersinfo);
+        lssdp_error("Call to GetAdaptersAddresses failed with error: %d\n",
+            dwRetVal);
+        return -1;
+    }
+    dwRetVal = GetAdaptersInfo(p_adaptersinfo, &byte_size_of_adapters_info);
+    if (dwRetVal != NO_ERROR)
+    {
+        FREE(p_adaptersinfo);
+        lssdp_error("Call to GetAdaptersAddresses failed with error: %d\n",
+            dwRetVal);
+        return -1;
+    }
+    lssdp->interface_num = 0;
+    size_t current_idx = 0;
+    //add localhost (this is not in the adaptersinfo)
+    strcpy(lssdp->intf[current_idx].name,
+        "localhost");
+    memcpy(lssdp->intf[current_idx].ip,
+        "127.0.0.1",
+        LSSDP_IP_LEN);
+    lssdp->intf[current_idx].addr = inet_addr("127.0.0.1");
+    lssdp->intf[current_idx].netmask = inet_addr("255.0.0.0");
+    lssdp->interface_num = 1;
+    current_idx = 1;
+
+    PIP_ADAPTER_INFO current_p_adaptersinfo = p_adaptersinfo;
+    while (current_p_adaptersinfo != NULL)
+    {
+        PIP_ADDR_STRING current_address = &(current_p_adaptersinfo->IpAddressList);
+        while (current_address != NULL)
+        {
+            uint32_t addr = inet_addr(current_address->IpAddress.String);
+            if (addr != 0)
+            {
+                current_idx = lssdp->interface_num;
+                memcpy(lssdp->intf[current_idx].name,
+                    current_p_adaptersinfo->Description,
+                    LSSDP_INTERFACE_NAME_LEN);
+                memcpy(lssdp->intf[current_idx].ip,
+                    current_address->IpAddress.String,
+                    LSSDP_IP_LEN);
+                lssdp->intf[current_idx].addr = addr;
+                lssdp->intf[current_idx].netmask = inet_addr(current_address->IpMask.String);
+
+                ++lssdp->interface_num;
+            }
+            if (lssdp->interface_num == LSSDP_INTERFACE_LIST_SIZE)
+            {
+                current_address = NULL;
+            }
+            else
+            {
+                current_address = current_address->Next;
+            }
+        }
+        if (lssdp->interface_num == LSSDP_INTERFACE_LIST_SIZE
+            || current_p_adaptersinfo->Next == NULL)
+        {
+            current_p_adaptersinfo = NULL;
+        }
+        else
+        {
+            current_p_adaptersinfo = current_p_adaptersinfo->Next;
+        }
+    }
+    FREE(p_adaptersinfo);
+    result = 0;
+#else //WIN32
     /* Reference to this article:
      * http://stackoverflow.com/a/8007079
      */
 
     // 3. create UDP socket
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    SOCKET_TYPE fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
         lssdp_error("create socket failed, errno = %s (%d)\n", strerror(errno), errno);
         goto end;
     }
 
     // 4. get ifconfig
-    char buffer[LSSDP_BUFFER_LEN] = {};
+    char buffer[LSSDP_BUFFER_LEN];
     struct ifconf ifc = {
         .ifc_len = sizeof(buffer),
         .ifc_buf = (caddr_t) buffer
@@ -166,13 +301,13 @@ int lssdp_network_interface_update(lssdp_ctx * lssdp) {
 
         // 5-4. set interface
         size_t n = lssdp->interface_num;
-        snprintf(lssdp->interface[n].name, LSSDP_INTERFACE_NAME_LEN, "%s", ifr->ifr_name); // name
-        snprintf(lssdp->interface[n].ip,   LSSDP_IP_LEN,             "%s", ip);            // ip string
-        lssdp->interface[n].addr = addr->sin_addr.s_addr;                                  // address in network byte order
+        snprintf(lssdp->intf[n].name, LSSDP_INTERFACE_NAME_LEN, "%s", ifr->ifr_name); // name
+        snprintf(lssdp->intf[n].ip,   LSSDP_IP_LEN,             "%s", ip);            // ip string
+        lssdp->intf[n].addr = addr->sin_addr.s_addr;                                  // address in network byte order
 
         // set network mask
         addr = (struct sockaddr_in *) &netmask.ifr_addr;
-        lssdp->interface[n].netmask = addr->sin_addr.s_addr;                               // mask in network byte order
+        lssdp->intf[n].netmask = addr->sin_addr.s_addr;                               // mask in network byte order
 
         // increase interface number
         lssdp->interface_num++;
@@ -185,8 +320,10 @@ end:
         lssdp_error("close fd %d failed, errno = %s (%d)\n", strerror(errno), errno);
     }
 
+#endif //WIN32
+
     // compare with original interface
-    if (memcmp(original_interface, lssdp->interface, SIZE_OF_INTERFACE_LIST) == 0) {
+    if (memcmp(original_interface, lssdp->intf, SIZE_OF_INTERFACE_LIST) == 0) {
         // interface is not changed
         return result;
     }
@@ -227,20 +364,37 @@ int lssdp_socket_create(lssdp_ctx * lssdp) {
     }
 
     int result = -1;
-
     // set non-blocking
+    
+#ifdef WIN32
+    u_long mode = 1;
+    if (ioctlsocket(lssdp->sock, FIONBIO, &mode) != 0)
+    {
+        lssdp_error("ioctl FIONBIO failed, errno = %s (%d)\n", strerror(errno), errno);
+        goto end;
+    }
+    // set reuse address
+    char opt = 1;
+    if (setsockopt(lssdp->sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) != 0) {
+        lssdp_error("setsockopt SO_REUSEADDR failed, errno = %s (%d)\n", strerror(errno), errno);
+        goto end;
+    }
+#else // WIN32
     int opt = 1;
     if (ioctl(lssdp->sock, FIONBIO, &opt) != 0) {
         lssdp_error("ioctl FIONBIO failed, errno = %s (%d)\n", strerror(errno), errno);
         goto end;
     }
-
     // set reuse address
     if (setsockopt(lssdp->sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) != 0) {
         lssdp_error("setsockopt SO_REUSEADDR failed, errno = %s (%d)\n", strerror(errno), errno);
         goto end;
     }
-
+#endif // WIN32
+    
+    
+#ifdef WIN32
+#else
     // set FD_CLOEXEC (http://kaivy2001.pixnet.net/blog/post/32726732)
     int sock_opt = fcntl(lssdp->sock, F_GETFD);
     if (sock_opt == -1) {
@@ -251,7 +405,7 @@ int lssdp_socket_create(lssdp_ctx * lssdp) {
             lssdp_error("fcntl F_SETFD FD_CLOEXEC failed, errno = %s (%d)\n", strerror(errno), errno);
         }
     }
-
+#endif
     // bind socket
     struct sockaddr_in addr = {
         .sin_family      = AF_INET,
@@ -268,11 +422,18 @@ int lssdp_socket_create(lssdp_ctx * lssdp) {
         .imr_multiaddr.s_addr = inet_addr(Global.ADDR_MULTICAST),
         .imr_interface.s_addr = htonl(INADDR_ANY)
     };
-    if (setsockopt(lssdp->sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &imr, sizeof(struct ip_mreq)) != 0) {
+#ifdef WIN32
+    if (setsockopt(lssdp->sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (const char*)&imr, sizeof(imr)) != 0) {
+        lssdp_error("setsockopt IP_ADD_MEMBERSHIP failed: %s (%d)\n", strerror(errno), errno);
+        goto end;
+    }
+#else
+    if (setsockopt(lssdp->sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &imr, sizeof(imr)) != 0) {
         lssdp_error("setsockopt IP_ADD_MEMBERSHIP failed: %s (%d)\n", strerror(errno), errno);
         goto end;
     }
 
+#endif
     lssdp_info("create SSDP socket %d\n", lssdp->sock);
     result = 0;
 end:
@@ -296,7 +457,12 @@ int lssdp_socket_close(lssdp_ctx * lssdp) {
     }
 
     // close socket
-    if (close(lssdp->sock) != 0) {
+#ifdef WIN32 
+    if (closesocket(lssdp->sock) != 0)
+#else //WIN32
+    if (close(lssdp->sock) != 0)
+#endif
+    {
         lssdp_error("close socket %d failed, errno = %s (%d)\n", lssdp->sock, strerror(errno), errno);
         return -1;
     };
@@ -327,26 +493,32 @@ int lssdp_socket_read(lssdp_ctx * lssdp) {
         return -1;
     }
 
-    char buffer[LSSDP_BUFFER_LEN] = {};
-    struct sockaddr_in address = {};
+    char buffer[LSSDP_BUFFER_LEN];
+    memset(buffer, 0, sizeof(buffer));
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
     socklen_t address_len = sizeof(struct sockaddr_in);
 
-    ssize_t recv_len = recvfrom(lssdp->sock, buffer, sizeof(buffer), 0, (struct sockaddr *)&address, &address_len);
+    size_t recv_len = recvfrom(lssdp->sock, buffer, sizeof(buffer), 0, (struct sockaddr *)&address, &address_len);
     if (recv_len == -1) {
         lssdp_error("recvfrom fd %d failed, errno = %s (%d)\n", lssdp->sock, strerror(errno), errno);
         return -1;
     }
 
-    // ignore the SSDP packet received from self
-    size_t i;
-    for (i = 0; i < lssdp->interface_num; i++) {
-        if (lssdp->interface[i].addr == address.sin_addr.s_addr) {
-            goto end;
+    if (!lssdp->rcv_packets_from_myself)
+    {
+        // ignore the SSDP packet received from self
+        size_t i;
+        for (i = 0; i < lssdp->interface_num; i++) {
+            if (lssdp->intf[i].addr == address.sin_addr.s_addr) {
+                goto end;
+            }
         }
     }
 
     // parse SSDP packet to struct
-    lssdp_packet packet = {};
+    lssdp_packet packet;
+    memset(&packet, 0, sizeof(packet));
     if (lssdp_packet_parser(buffer, recv_len, &packet) != 0) {
         goto end;
     }
@@ -401,7 +573,8 @@ int lssdp_send_msearch(lssdp_ctx * lssdp) {
     }
 
     // 1. set M-SEARCH packet
-    char msearch[LSSDP_BUFFER_LEN] = {};
+    char msearch[LSSDP_BUFFER_LEN];
+    memset(msearch, 0, sizeof(msearch));
     snprintf(msearch, sizeof(msearch),
         "%s"
         "HOST:%s:%d\r\n"
@@ -418,17 +591,21 @@ int lssdp_send_msearch(lssdp_ctx * lssdp) {
     // 2. send M-SEARCH to each interface
     size_t i;
     for (i = 0; i < lssdp->interface_num; i++) {
-        struct lssdp_interface * interface = &lssdp->interface[i];
-
-        // avoid sending multicast to localhost
-        if (interface->addr == inet_addr(Global.ADDR_LOCALHOST)) {
-            continue;
+        struct lssdp_interface * intf = &lssdp->intf[i];
+        
+        //do not send to localhost if option is set to false
+        if (!lssdp->send_to_localhost)
+        {
+            // avoid sending multicast to localhost
+            if (intf->addr == inet_addr(Global.ADDR_LOCALHOST)) {
+                continue;
+            }
         }
 
         // send M-SEARCH
-        int ret = send_multicast_data(msearch, *interface, lssdp->port);
+        int ret = send_multicast_data(msearch, *intf, lssdp->port);
         if (ret == 0 && lssdp->debug) {
-            lssdp_info("SEND => %-8s   %s => MULTICAST\n", Global.MSEARCH, interface->ip);
+            lssdp_info("SEND => %-8s   %s => MULTICAST\n", Global.MSEARCH, intf->ip);
         }
     }
 
@@ -455,15 +632,16 @@ int lssdp_send_notify(lssdp_ctx * lssdp) {
 
     size_t i;
     for (i = 0; i < lssdp->interface_num; i++) {
-        struct lssdp_interface * interface = &lssdp->interface[i];
+        struct lssdp_interface * intf = &lssdp->intf[i];
 
         // avoid sending multicast to localhost
-        if (interface->addr == inet_addr(Global.ADDR_LOCALHOST)) {
+        if (intf->addr == inet_addr(Global.ADDR_LOCALHOST)) {
             continue;
         }
 
         // set notify packet
-        char notify[LSSDP_BUFFER_LEN] = {};
+        char notify[LSSDP_BUFFER_LEN];
+        memset(notify, 0, sizeof(notify));
         char * domain = lssdp->header.location.domain;
         snprintf(notify, sizeof(notify),
             "%s"
@@ -480,7 +658,7 @@ int lssdp_send_notify(lssdp_ctx * lssdp) {
             Global.HEADER_NOTIFY,                       // HEADER
             Global.ADDR_MULTICAST, lssdp->port,         // HOST
             lssdp->header.location.prefix,              // LOCATION
-            strlen(domain) > 0 ? domain : interface->ip,
+            strlen(domain) > 0 ? domain : intf->ip,
             lssdp->header.location.suffix,
             lssdp->header.search_target,                // NT (Notify Type)
             lssdp->header.unique_service_name,          // USN
@@ -489,9 +667,9 @@ int lssdp_send_notify(lssdp_ctx * lssdp) {
         );
 
         // send NOTIFY
-        int ret = send_multicast_data(notify, *interface, lssdp->port);
+        int ret = send_multicast_data(notify, *intf, lssdp->port);
         if (ret == 0 && lssdp->debug) {
-            lssdp_info("SEND => %-8s   %s => MULTICAST\n", Global.NOTIFY, interface->ip);
+            lssdp_info("SEND => %-8s   %s => MULTICAST\n", Global.NOTIFY, intf->ip);
         }
     }
 
@@ -514,7 +692,7 @@ int lssdp_neighbor_check_timeout(lssdp_ctx * lssdp) {
         return 0;
     }
 
-    long long current_time = get_current_time();
+    long long current_time = lssdp_get_current_time();
     if (current_time < 0) {
         lssdp_error("got invalid timestamp %lld\n", current_time);
         return -1;
@@ -524,7 +702,7 @@ int lssdp_neighbor_check_timeout(lssdp_ctx * lssdp) {
     lssdp_nbr * prev = NULL;
     lssdp_nbr * nbr  = lssdp->neighbor_list;
     while (nbr != NULL) {
-        long pass_time = current_time - nbr->update_time;
+        long long pass_time = current_time - nbr->update_time;
         if (pass_time < lssdp->neighbor_timeout) {
             prev = nbr;
             nbr  = nbr->next;
@@ -532,7 +710,7 @@ int lssdp_neighbor_check_timeout(lssdp_ctx * lssdp) {
         }
 
         is_changed = true;
-        lssdp_warn("remove timeout SSDP neighbor: %s (%s) (%ldms)\n", nbr->sm_id, nbr->location, pass_time);
+        lssdp_warn("remove timeout SSDP neighbor: %s (%s) (%lld)\n", nbr->sm_id, nbr->location, pass_time);
 
         if (prev == NULL) {
             // it's first neighbor in list
@@ -561,7 +739,7 @@ void lssdp_set_log_callback(void (* callback)(const char * file, const char * ta
 
 /** Internal Function **/
 
-static int send_multicast_data(const char * data, const struct lssdp_interface interface, unsigned short ssdp_port) {
+static int send_multicast_data(const char * data, const struct lssdp_interface intf, unsigned short ssdp_port) {
     if (data == NULL) {
         lssdp_error("data should not be NULL\n");
         return -1;
@@ -573,7 +751,7 @@ static int send_multicast_data(const char * data, const struct lssdp_interface i
         return -1;
     }
 
-    if (strlen(interface.name) == 0) {
+    if (strlen(intf.name) == 0) {
         lssdp_error("interface.name should not be empty\n");
         return -1;
     }
@@ -581,7 +759,7 @@ static int send_multicast_data(const char * data, const struct lssdp_interface i
     int result = -1;
 
     // 1. create UDP socket
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    SOCKET_TYPE fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) {
         lssdp_error("create socket failed, errno = %s (%d)\n", strerror(errno), errno);
         goto end;
@@ -590,7 +768,7 @@ static int send_multicast_data(const char * data, const struct lssdp_interface i
     // 2. bind socket
     struct sockaddr_in addr = {
         .sin_family      = AF_INET,
-        .sin_addr.s_addr = interface.addr
+        .sin_addr.s_addr = intf.addr
     };
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         lssdp_error("bind failed, errno = %s (%d)\n", strerror(errno), errno);
@@ -609,20 +787,34 @@ static int send_multicast_data(const char * data, const struct lssdp_interface i
         .sin_family = AF_INET,
         .sin_port = htons(ssdp_port)
     };
+#ifdef WIN32
+    if (InetPton(AF_INET, Global.ADDR_MULTICAST, &dest_addr.sin_addr) == 0) {
+        lssdp_error("inet_aton failed, errno = %s (%d)\n", strerror(errno), errno);
+        goto end;
+    }
+#else
     if (inet_aton(Global.ADDR_MULTICAST, &dest_addr.sin_addr) == 0) {
         lssdp_error("inet_aton failed, errno = %s (%d)\n", strerror(errno), errno);
         goto end;
     }
+#endif
 
     // 5. send data
-    if (sendto(fd, data, data_len, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) == -1) {
-        lssdp_error("sendto %s (%s) failed, errno = %s (%d)\n", interface.name, interface.ip, strerror(errno), errno);
+    if (sendto(fd, data, (int)data_len, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) == -1) {
+        lssdp_error("sendto %s (%s) failed, errno = %s (%d)\n", intf.name, intf.ip, strerror(errno), errno);
         goto end;
     }
 
     result = 0;
 end:
-    if (fd >= 0 && close(fd) != 0) {
+    if (fd >= 0
+#ifdef WIN32
+        && closesocket(fd)
+#else 
+        && close(fd) 
+#endif
+        != 0) 
+    {
         lssdp_error("close fd %d failed, errno = %s (%d)\n", strerror(errno), errno);
     }
     return result;
@@ -630,15 +822,16 @@ end:
 
 static int lssdp_send_response(lssdp_ctx * lssdp, struct sockaddr_in address) {
     // get M-SEARCH IP
-    char msearch_ip[LSSDP_IP_LEN] = {};
+    char msearch_ip[LSSDP_IP_LEN];
+    memset(msearch_ip, 0, sizeof(msearch_ip));
     if (inet_ntop(AF_INET, &address.sin_addr, msearch_ip, sizeof(msearch_ip)) == NULL) {
         lssdp_error("inet_ntop failed, errno = %s (%d)\n", strerror(errno), errno);
         return -1;
     }
 
     // 1. find the interface which is in LAN
-    struct lssdp_interface * interface = find_interface_in_LAN(lssdp, address.sin_addr.s_addr);
-    if (interface == NULL) {
+    struct lssdp_interface * intf = find_interface_in_LAN(lssdp, address.sin_addr.s_addr);
+    if (intf == NULL) {
         if (lssdp->debug) {
             lssdp_info("RECV <- %-8s   Interface is not found        %s\n", Global.MSEARCH, msearch_ip);
         }
@@ -650,7 +843,8 @@ static int lssdp_send_response(lssdp_ctx * lssdp, struct sockaddr_in address) {
     }
 
     // 2. set response packet
-    char response[LSSDP_BUFFER_LEN] = {};
+    char response[LSSDP_BUFFER_LEN];
+    memset(response, 0, sizeof(response));
     char * domain = lssdp->header.location.domain;
     int response_len = snprintf(response, sizeof(response),
         "%s"
@@ -666,7 +860,7 @@ static int lssdp_send_response(lssdp_ctx * lssdp, struct sockaddr_in address) {
         "\r\n",
         Global.HEADER_RESPONSE,                     // HEADER
         lssdp->header.location.prefix,              // LOCATION
-        strlen(domain) > 0 ? domain : interface->ip,
+        strlen(domain) > 0 ? domain : intf->ip,
         lssdp->header.location.suffix,
         lssdp->header.search_target,                // ST (Search Target)
         lssdp->header.unique_service_name,          // USN
@@ -678,7 +872,7 @@ static int lssdp_send_response(lssdp_ctx * lssdp, struct sockaddr_in address) {
     address.sin_port = htons(lssdp->port);
 
     if (lssdp->debug) {
-        lssdp_info("RECV <- %-8s   %s <- %s\n", Global.MSEARCH, interface->ip, msearch_ip);
+        lssdp_info("RECV <- %-8s   %s <- %s\n", Global.MSEARCH, intf->ip, msearch_ip);
     }
 
     // 4. send data
@@ -688,7 +882,7 @@ static int lssdp_send_response(lssdp_ctx * lssdp, struct sockaddr_in address) {
     }
 
     if (lssdp->debug) {
-        lssdp_info("SEND => %-8s   %s => %s\n", Global.RESPONSE, interface->ip, msearch_ip);
+        lssdp_info("SEND => %-8s   %s => %s\n", Global.RESPONSE, intf->ip, msearch_ip);
     }
 
     return 0;
@@ -734,7 +928,7 @@ static int lssdp_packet_parser(const char * data, size_t data_len, lssdp_packet 
     }
 
     // 3. set update_time
-    long long current_time = get_current_time();
+    long long current_time = lssdp_get_current_time();
     if (current_time < 0) {
         lssdp_error("got invalid timestamp %lld\n", current_time);
         return -1;
@@ -742,6 +936,13 @@ static int lssdp_packet_parser(const char * data, size_t data_len, lssdp_packet 
     packet->update_time = current_time;
     return 0;
 }
+
+#ifdef WIN32
+size_t strncasecmp(const char* src, const char* dest, size_t len)
+{
+    return _strnicmp(src, dest, len);
+}
+#endif 
 
 static int parse_field_line(const char * data, size_t start, size_t end, lssdp_packet * packet) {
     // 1. find the colon
@@ -823,7 +1024,7 @@ static int get_colon_index(const char * string, size_t start, size_t end) {
     size_t i;
     for (i = start; i <= end; i++) {
         if (string[i] == ':') {
-            return i;
+            return (int)i;
         }
     }
     return -1;
@@ -844,22 +1045,28 @@ static int trim_spaces(const char * string, size_t * start, size_t * end) {
     *end   = j;
     return 0;
 }
-
-static long long get_current_time() {
-    struct timeval time = {};
+#ifdef WIN32
+long long lssdp_get_current_time() {
+    return GetTickCount64();
+}
+#else 
+long long lssdp_get_current_time() {
+    struct timeval time;
     if (gettimeofday(&time, NULL) == -1) {
         lssdp_error("gettimeofday failed, errno = %s (%d)\n", strerror(errno), errno);
         return -1;
     }
-    return (long long) time.tv_sec * 1000 + (long long) time.tv_usec / 1000;
+    return (long long)time.tv_sec * 1000 + (long long)time.tv_usec / 1000;
 }
+#endif
 
 static int lssdp_log(int level, int line, const char * func, const char * format, ...) {
     if (Global.log_callback == NULL) {
         return -1;
     }
 
-    char message[LSSDP_BUFFER_LEN] = {};
+    char message[LSSDP_BUFFER_LEN];
+    memset(message, 0, sizeof(message));
 
     // create message by va_list
     va_list args;
@@ -976,7 +1183,7 @@ static struct lssdp_interface * find_interface_in_LAN(lssdp_ctx * lssdp, uint32_
     struct lssdp_interface * ifc;
     size_t i;
     for (i = 0; i < lssdp->interface_num; i++) {
-        ifc = &lssdp->interface[i];
+        ifc = &lssdp->intf[i];
 
         // mask address to check whether the interface is under the same Local Network Area or not
         if ((ifc->addr & ifc->netmask) == (address & ifc->netmask)) {
