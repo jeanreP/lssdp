@@ -22,5 +22,5 @@
 #############################################################################################
 
 @PACKAGE_INIT@
-include(${CMAKE_CURRENT_LIST_DIR}/a_util_system_targets.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/lssdp_targets.cmake)
 check_required_components(lssdp)
